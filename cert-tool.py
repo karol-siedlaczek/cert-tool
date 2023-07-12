@@ -12,7 +12,6 @@ logging.basicConfig(filename='file.log', format='%(asctime)s %(name)s %(levelnam
 
 
 class Domain:
-
     def __init__(self, id, name, extension):
         self.id = id
         self.name = f'{name}.{extension}'
@@ -22,7 +21,6 @@ class Domain:
 
 
 class DomainProvider:
-
     def __init__(self, username, password):
         self.base_url = 'https://www.domeny.tv'
         self.headers = {'X-Requested-With': 'XMLHttpRequest'}
