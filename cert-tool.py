@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
 import os
+import re
+import sys
+import yaml
 import json
 import logging
 import argparse
@@ -32,7 +35,7 @@ class Domain:
             'priority': priority,
         }
         dns_records.append(new_dns_record)
-        response = self.provider.update_records(self, dns_records)
+        response = self.provider.set_records(self, dns_records)
         if response.ok:
             logging.info(f'DNS record "{json.dumps(new_dns_record)}" added to "{self}" domain')
             self.records = dns_records
@@ -48,7 +51,7 @@ class Domain:
         if len(dns_records) == len(new_dns_records):
             raise LookupError(f'Cannot found DNS record "{{"subdomain": "{subdomain}", "type": "{record_type}", "value": "{value}"}}" in "{self}" domain configuration')
 
-        response = self.provider.update_records(self, new_dns_records)
+        response = self.provider.set_records(self, new_dns_records)
         if response.ok:
             logging.info(f'DNS record "{{"subdomain": "{subdomain}", "type": "{record_type}", "value": "{value}"}}" removed from "{self}" domain configuration')
             self.records = new_dns_records
@@ -80,7 +83,8 @@ class Provider:
             raise ConnectionRefusedError(f'Authorization failed for "{username}" user with status code "{response.status_code}" to "{url}"')
 
     def __set_domains(self):
-        for domain_json in self.__get_data(f'{self.base_url}/api/domains/getPlDomains/0')['list']:
+        domains = self.__get_data(f'{self.base_url}/api/domains/getPlDomains/0')['list']
+        for domain_json in domains:
             domain = Domain(self, domain_json['domain_id'], domain_json['domain_name'], domain_json['domain_ext'])
             self.domains.append(domain)
 
@@ -96,10 +100,17 @@ class Provider:
             if domain.name == name:
                 return domain
 
-    def update_records(self, domain, records):
+    def set_records(self, domain, records):
         url = f'{self.base_url}/api/DNSServer/saveRecords/{domain.id}'
         payload = {'records': records, 'srv': []}
         return self.session.post(url, json=payload, headers=self.headers)
+
+
+def run_command(command):
+    process = subprocess.run(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE, stdout=subprocess.PIPE, shell=True)
+    return_code = process.returncode
+    output = process.stderr if process.stderr else process.stdout
+    return output.decode('utf-8').replace('\n', ' '), return_code
 
 
 def parse_args():
@@ -110,33 +121,63 @@ def parse_args():
     return parser.parse_args()
 
 
+def get_challenge_values(domain):
+    with open('dns_challenges.yaml', 'r') as f:
+        dns_challenges = yaml.safe_load(f)
+
+    try:
+        dns_challenges[domain.name]
+    except KeyError:
+        msg, return_code = run_command(f'certbot --staging --text --agree-tos --email admin@{domain.name} --expand --configurator certbot-external-auth:out --certbot-external-auth:out-public-ip-logging-ok  -d {domain.name} -d \*.{domain.name} --preferred-challenges dns certonly 2> /dev/null')
+        certbot_output = json.loads(msg.split(' {')[0])
+        with open('dns_challenges.yaml', 'a') as file:
+            yaml.dump({certbot_output['domain']: {'txt_domain': certbot_output['txt_domain'], 'validation': certbot_output['validation']}}, file)
+        return certbot_output['txt_domain'], certbot_output['validation']
+
+
 if __name__ == "__main__":
     args = parse_args()
     logging.basicConfig(filename='file.log', format='%(asctime)s %(name)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S', level=logging.DEBUG)
+    domain1 = Domain(None, '1', 'juliakowalska', 'com')
+    domain2 = Domain(None, '1', 'siedlaczek', 'org.pl')
+    get_challenge_values(domain2)
     try:
-        cmd = 'touch test.txt'
-
-        try:
-            process = subprocess.run(shlex.split(command),
-                                     stdin=subprocess.DEVNULL,
-                                     stderr=subprocess.PIPE,
-                                     stdout=subprocess.PIPE,
-                                     timeout=15)
-
-            print(process.stdout)
-            print(process.stderr)
-            print(process.returncode)
-            #out, err = process.communicate(input=subprocess.PIPE, timeout=15)
-        except subprocess.TimeoutExpired as e:
-            print(e)
+        #msg, return_code = run_command('certbot certonly --dry-run  --test-cert -m admin@siedlaczek.org.pl --agree-tos --manual --manual-public-ip-logging-ok -d \*.siedlaczek.org.pl -d siedlaczek.org.pl --preferred-challenges dns > test.txt')
+        #msg, return_code = run_command('certbot certonly --manual --manual-auth-hook /mnt/f/Programs/Repository/Python/cert-tool/acme-dns-auth.py --preferred-challenges dns --debug-challenges -d aap.example.com')
+        print('1')
 
         #provider = Provider(args.username, args.password)
         #domain = provider.get_domain_by_name('some_domain')
         #domain.add_dns_record('test', 'TXT', '1.1.1.1')
         #domain.remove_dns_record('test', 'TXT', '1.1.1.1')
-    except (ConnectionRefusedError, ValueError, LookupError) as e:
+    except (ConnectionRefusedError, ValueError, LookupError, FileNotFoundError) as e:
         logging.error(f'{os.path.basename(__file__)}: {e}')
         print(f'{os.path.basename(__file__)}: {e}')
 
+# dig +short -t txt siedlaczek.org.pl
 
-#certbot -d \*.siedlaczek.org.pl -d domain --manual --preferred-challenges dns certonly
+#certbot certonly -n -m admin@siedlaczek.org.pl --agree-tos --manual --manual-public-ip-logging-ok --manual-auth-hook /mnt/f/Programs/Repository/Python/cert-tool/acme-dns-auth.py -d \*.siedlaczek.org.pl -d siedlaczek.org.pl --preferred-challenges dns
+#certbot -d \*.siedlaczek.org.pl --manual-public-ip-logging-ok -d siedlaczek.org.pl --manual --preferred-challenges dns certonly
+#certbot certonly -m -n admin@siedlaczek.org.pl --agree-tos -d \*.siedlaczek.org.pl -d siedlaczek.org.pl --manual --preferred-challenges dns
+
+
+
+#  pip install certbot-external-auth
+
+
+# regex = fr'^(?P<txt_key>_acme-challenge.{domain.name})'
+    # key = None
+    # try:
+    #     with open(f'{acme_values_path}/{domain.name}.txt', 'r') as f:
+    #         lines = f.readlines()
+    #         for line in lines:
+    #             if key and line.strip() != "":
+    #                 value = line.strip()
+    #                 break
+    #             result = re.search(regex, line)
+    #             if result:
+    #                 key = result.group('txt_key')
+    #     print(f'{key}: {value}')
+    #     return key, value
+    # except Exception as e:
+    #     raise type(e)(f'Failed retrieving TXT records for "{domain.name}" domain with error message: "{e}"')
