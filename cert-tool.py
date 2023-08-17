@@ -106,6 +106,59 @@ class Provider:
         return self.session.post(url, json=payload, headers=self.headers)
 
 
+class CertBot:
+    server = 'https://acme-v02.api.letsencrypt.org/directory'
+    state_file = f'{os.path.dirname(os.path.realpath(__file__))}/dns_challenges.yaml'
+
+    def __init__(self, domain):
+        self.domain = domain
+        self.__set_challenge_values()
+
+    def __set_challenge_values(self):
+        with open(self.state_file, 'r') as f:
+            dns_challenges = yaml.safe_load(f)
+        try:
+            self.key = dns_challenges[self.domain.name]['txt_key']
+            self.value = dns_challenges[self.domain.name]['txt_value']
+            self.state = dns_challenges[self.domain.name]['state']
+        except (KeyError, TypeError):
+            cmd = f'certbot certonly --staging --manual --preferred-challenges dns --email admin@{self.domain.name} --agree-tos --manual-public-ip-logging-ok --server {self.server} -d {self.domain.name} -d *.{self.domain.name} 2> /dev/null'
+            print(cmd)
+            logging.info(f'request for dns challenge values for "{self.domain}" domain has been sent')
+            #msg, return_code = run_command(cmd)
+            msg = '- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Please deploy a DNS TXT record under the name _acme-challenge.juliakowalska.com with the following value:  gLfzfmGYM-JDh6YDB9Or9FP2-ODNbK4hI0qgdjGbhow  Before continuing, verify the record is deployed. - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Press Enter to Continue'
+            print(msg)
+            challenge_values = re.search(f'name[\s]*(.*.{self.domain.name}).*value:[\s]*([a-zA-Z-0-9]*)', msg)
+            with open(self.state_file, 'a') as file:
+                state = 'pending'
+                yaml.dump({
+                    self.domain.name: {
+                        'txt_key': challenge_values.group(1),
+                        'txt_value': challenge_values.group(2),
+                        'state': state}}, file)
+                self.key = challenge_values[0]
+                self.value = challenge_values[1]
+                self.state = state
+            logging.info(f'new values for dns challenge "{self.domain}" domain has been saved in "{self.state_file}" with "{self.state}" state')
+
+    def is_txt_record_present(self):
+        msg, return_code = run_command(f'dig -t txt {self.key} +short')
+        try:
+            msg = msg.strip().replace('"', '')
+        except AttributeError:
+            return False
+        if msg and msg != self.value:
+            logging.error(f'dig returned "{msg}", value for "{self.key}" TXT record should be "{self.value}"')
+        else:
+            return msg == self.value
+
+    def get_certs(self):
+        cmd = f'certbot certonly --staging --manual --preferred-challenges dns --email admin@{self.domain.name} --agree-tos --manual-public-ip-logging-ok --server {self.server} -d {self.domain.name} -d *.{self.domain.name}'
+        print(cmd)
+        msg, return_code = run_command(cmd)
+        print(msg)
+        print(return_code)
+
 def run_command(command):
     process = subprocess.run(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE, stdout=subprocess.PIPE, shell=True)
     return_code = process.returncode
@@ -121,30 +174,20 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_challenge_values(domain):
-    with open('dns_challenges.yaml', 'r') as f:
-        dns_challenges = yaml.safe_load(f)
-
-    try:
-        dns_challenges[domain.name]
-    except KeyError:
-        msg, return_code = run_command(f'certbot --staging --text --agree-tos --email admin@{domain.name} --expand --configurator certbot-external-auth:out --certbot-external-auth:out-public-ip-logging-ok  -d {domain.name} -d \*.{domain.name} --preferred-challenges dns certonly 2> /dev/null')
-        certbot_output = json.loads(msg.split(' {')[0])
-        with open('dns_challenges.yaml', 'a') as file:
-            yaml.dump({certbot_output['domain']: {'txt_domain': certbot_output['txt_domain'], 'validation': certbot_output['validation']}}, file)
-        return certbot_output['txt_domain'], certbot_output['validation']
-
-
 if __name__ == "__main__":
     args = parse_args()
     logging.basicConfig(filename='file.log', format='%(asctime)s %(name)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S', level=logging.DEBUG)
     domain1 = Domain(None, '1', 'juliakowalska', 'com')
     domain2 = Domain(None, '1', 'siedlaczek', 'org.pl')
-    get_challenge_values(domain2)
+    certbot = CertBot(domain1)
+    print(certbot.key)
+    print(certbot.value)
+    print(certbot.is_txt_record_present())
+    certbot.get_certs()
     try:
         #msg, return_code = run_command('certbot certonly --dry-run  --test-cert -m admin@siedlaczek.org.pl --agree-tos --manual --manual-public-ip-logging-ok -d \*.siedlaczek.org.pl -d siedlaczek.org.pl --preferred-challenges dns > test.txt')
         #msg, return_code = run_command('certbot certonly --manual --manual-auth-hook /mnt/f/Programs/Repository/Python/cert-tool/acme-dns-auth.py --preferred-challenges dns --debug-challenges -d aap.example.com')
-        print('1')
+        print('end')
 
         #provider = Provider(args.username, args.password)
         #domain = provider.get_domain_by_name('some_domain')
@@ -155,7 +198,7 @@ if __name__ == "__main__":
         print(f'{os.path.basename(__file__)}: {e}')
 
 # dig +short -t txt siedlaczek.org.pl
-
+#certbot certonly --manual --preferred-challenges=dns --email admin@siedlaczek.org.pl --manual-public-ip-logging-ok --server https://acme-v02.api.letsencrypt.org/directory --agree-tos -d siedlaczek.org.pl -d *.siedlaczek.org.pl
 #certbot certonly -n -m admin@siedlaczek.org.pl --agree-tos --manual --manual-public-ip-logging-ok --manual-auth-hook /mnt/f/Programs/Repository/Python/cert-tool/acme-dns-auth.py -d \*.siedlaczek.org.pl -d siedlaczek.org.pl --preferred-challenges dns
 #certbot -d \*.siedlaczek.org.pl --manual-public-ip-logging-ok -d siedlaczek.org.pl --manual --preferred-challenges dns certonly
 #certbot certonly -m -n admin@siedlaczek.org.pl --agree-tos -d \*.siedlaczek.org.pl -d siedlaczek.org.pl --manual --preferred-challenges dns
