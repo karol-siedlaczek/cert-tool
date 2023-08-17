@@ -9,7 +9,6 @@ import logging
 import argparse
 import requests
 import subprocess
-import shlex
 
 ALLOWED_RECORD_TYPES = ['TXT']
 
@@ -111,6 +110,10 @@ class CertBot:
     state_file = f'{os.path.dirname(os.path.realpath(__file__))}/dns_challenges.yaml'
 
     def __init__(self, domain):
+
+        if not os.path.isfile(self.state_file):
+            with open(self.state_file, 'w') as f:
+                pass
         self.domain = domain
         self.__set_challenge_values()
 
@@ -125,8 +128,8 @@ class CertBot:
             cmd = f'certbot certonly --staging --manual --preferred-challenges dns --email admin@{self.domain.name} --agree-tos --manual-public-ip-logging-ok --server {self.server} -d {self.domain.name} -d *.{self.domain.name} 2> /dev/null'
             print(cmd)
             logging.info(f'request for dns challenge values for "{self.domain}" domain has been sent')
-            #msg, return_code = run_command(cmd)
-            msg = '- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Please deploy a DNS TXT record under the name _acme-challenge.juliakowalska.com with the following value:  gLfzfmGYM-JDh6YDB9Or9FP2-ODNbK4hI0qgdjGbhow  Before continuing, verify the record is deployed. - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Press Enter to Continue'
+            msg, return_code = run_command(cmd)
+            #msg = '- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Please deploy a DNS TXT record under the name _acme-challenge.juliakowalska.com with the following value:  gLfzfmGYM-JDh6YDB9Or9FP2-ODNbK4hI0qgdjGbhow  Before continuing, verify the record is deployed. - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Press Enter to Continue'
             print(msg)
             challenge_values = re.search(f'name[\s]*(.*.{self.domain.name}).*value:[\s]*([a-zA-Z-0-9]*)', msg)
             with open(self.state_file, 'a') as file:
@@ -155,9 +158,17 @@ class CertBot:
     def get_certs(self):
         cmd = f'certbot certonly --staging --manual --preferred-challenges dns --email admin@{self.domain.name} --agree-tos --manual-public-ip-logging-ok --server {self.server} -d {self.domain.name} -d *.{self.domain.name}'
         print(cmd)
-        msg, return_code = run_command(cmd)
-        print(msg)
-        print(return_code)
+        process = subprocess.Popen(cmd.split(' '), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate(input=b'\n\n')
+        print(stdout)
+        print('\n')
+        print(stderr)
+        print('\n')
+        print(process.returncode)
+        # msg, return_code = run_command(cmd)
+        # print(msg)
+        # print(return_code)
+
 
 def run_command(command):
     process = subprocess.run(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE, stdout=subprocess.PIPE, shell=True)
