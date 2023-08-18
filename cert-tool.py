@@ -5,12 +5,31 @@ import re
 import sys
 import yaml
 import json
+import time
 import logging
 import argparse
 import requests
 import subprocess
+import ssl
+import socket
 
-ALLOWED_RECORD_TYPES = ['TXT']
+CHECK_ACTION = 'check'
+INIT_ACTION = 'init'
+LIST_ACTION = 'list'
+
+DEFAULTS = {
+    'ACTION_CHOICES': [CHECK_ACTION, INIT_ACTION, LIST_ACTION],
+    'RECORD_TYPES': ['TXT', 'A', 'AAAA', 'MX', 'CNAME', 'REDIRECT', 'FRAME', 'CAA'],
+    'STATE_FILE': f'{os.path.dirname(os.path.realpath(__file__))}/dns_challenges.yaml',
+    'AUTH_FILE': os.path.join(os.path.expanduser("~"), '.cert-tool.passwd')
+}
+
+
+class Certificate:
+    def __init__(self, path):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'Certificate file {path} does not exist')
+        self.path = path
 
 
 class Domain:
@@ -21,7 +40,7 @@ class Domain:
         self.id = id
         self.name = f'{name}.{extension}'
 
-    def add_dns_record(self, subdomain, record_type, value, priority=0, ttl=86400):
+    def add_record(self, subdomain, record_type, value, priority=0, ttl=86400):
         dns_records = self.get_records()
         new_dns_record = {
             'caa_flag': "1",
@@ -41,7 +60,7 @@ class Domain:
         else:
             raise ValueError(f'Adding DNS record "{json.dumps(new_dns_record)}" failed for "{self}" domain with status code "{response.status_code}"')
 
-    def remove_dns_record(self, subdomain, record_type, value):
+    def remove_record(self, subdomain, record_type, value):
         dns_records = self.get_records()
         new_dns_records = []
         for dns_record in dns_records:
@@ -60,6 +79,25 @@ class Domain:
     def get_records(self):
         return self.records if self.records else self.provider.get_records(self)
 
+    def has_record(self, record_type, value, prefix=None):
+        fqdn = f"{prefix}.{self}" if prefix else self
+        if record_type not in DEFAULTS['RECORD_TYPES']:
+            raise ValueError(f'Cannot check "{record_type}" record with "{value}" value for "{fqdn}" domain, allowed record types are: {", ".join(DEFAULTS["RECORD_TYPES"])}')
+        msg, return_code = run_command(f'dig -t {record_type} {fqdn} +short')
+        try:
+            msg = msg.strip().replace('"', '')
+        except AttributeError:
+            return False
+        if msg and msg != value:
+            logging.warning(f'{record_type} record for "{fqdn}" domain returned "{msg}" value, not expected "{value}" value')
+            return False
+        else:
+            return True if msg == value else False
+
+    # def get_cert_expire_date(self):
+    #     ctx = ssl.create_default_context()
+    #     with ctx.wrap_socket(socket.socket())
+
     def __str__(self):
         return self.name
 
@@ -67,11 +105,13 @@ class Domain:
 class Provider:
     domains = []
 
-    def __init__(self, username, password):
+    def __init__(self, auth_file):
         self.base_url = 'https://www.domeny.tv'
         self.headers = {'X-Requested-With': 'XMLHttpRequest'}
         self.session = requests.session()
-        self.__init_session(username, password)
+        with open(auth_file, 'r') as f:
+            credentials = f.readline().split(':')
+        self.__init_session(credentials[0], credentials[1])
         self.__set_domains()
 
     def __init_session(self, username, password):
@@ -98,6 +138,7 @@ class Provider:
         for domain in self.domains:
             if domain.name == name:
                 return domain
+        raise AttributeError(f'Not found "{name}" domain in DNS config')
 
     def set_records(self, domain, records):
         url = f'{self.base_url}/api/DNSServer/saveRecords/{domain.id}'
@@ -107,10 +148,9 @@ class Provider:
 
 class CertBot:
     server = 'https://acme-v02.api.letsencrypt.org/directory'
-    state_file = f'{os.path.dirname(os.path.realpath(__file__))}/dns_challenges.yaml'
 
-    def __init__(self, domain):
-
+    def __init__(self, domain, state_file):
+        self.state_file = state_file
         if not os.path.isfile(self.state_file):
             with open(self.state_file, 'w') as f:
                 pass
@@ -125,13 +165,13 @@ class CertBot:
             self.value = dns_challenges[self.domain.name]['txt_value']
             self.state = dns_challenges[self.domain.name]['state']
         except (KeyError, TypeError):
-            cmd = f'certbot certonly --staging --manual --preferred-challenges dns --email admin@{self.domain.name} --agree-tos --manual-public-ip-logging-ok --server {self.server} -d {self.domain.name} -d *.{self.domain.name} 2> /dev/null'
+            cmd = f'certbot certonly --manual --preferred-challenges dns --email admin@{self.domain.name} --agree-tos --manual-public-ip-logging-ok --server {self.server} -d {self.domain.name} -d *.{self.domain.name} 2> /dev/null'
             print(cmd)
             logging.info(f'request for dns challenge values for "{self.domain}" domain has been sent')
             msg, return_code = run_command(cmd)
-            #msg = '- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Please deploy a DNS TXT record under the name _acme-challenge.juliakowalska.com with the following value:  gLfzfmGYM-JDh6YDB9Or9FP2-ODNbK4hI0qgdjGbhow  Before continuing, verify the record is deployed. - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Press Enter to Continue'
+            # msg = '- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Please deploy a DNS TXT record under the name _acme-challenge.juliakowalska.com with the following value:  gLfzfmGYM-JDh6YDB9Or9FP2-ODNbK4hI0qgdjGbhow  Before continuing, verify the record is deployed. - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Press Enter to Continue'
             print(msg)
-            challenge_values = re.search(f'name[\s]*(.*.{self.domain.name}).*value:[\s]*([a-zA-Z-0-9]*)', msg)
+            challenge_values = re.search(f'name[\s]*(.*.{self.domain.name}).*value:[\s]*([a-zA-Z-_0-9]*)', msg)
             with open(self.state_file, 'a') as file:
                 state = 'pending'
                 yaml.dump({
@@ -144,22 +184,13 @@ class CertBot:
                 self.state = state
             logging.info(f'new values for dns challenge "{self.domain}" domain has been saved in "{self.state_file}" with "{self.state}" state')
 
-    def is_txt_record_present(self):
-        msg, return_code = run_command(f'dig -t txt {self.key} +short')
-        try:
-            msg = msg.strip().replace('"', '')
-        except AttributeError:
-            return False
-        if msg and msg != self.value:
-            logging.error(f'dig returned "{msg}", value for "{self.key}" TXT record should be "{self.value}"')
-        else:
-            return msg == self.value
-
-    def get_certs(self):
-        cmd = f'certbot certonly --staging --manual --preferred-challenges dns --email admin@{self.domain.name} --agree-tos --manual-public-ip-logging-ok --server {self.server} -d {self.domain.name} -d *.{self.domain.name}'
+    def generate_cert(self):
+        cmd = f'certbot certonly --manual --preferred-challenges dns --email admin@{self.domain.name} --agree-tos --manual-public-ip-logging-ok --server {self.server} -d {self.domain.name} -d *.{self.domain.name}'
         print(cmd)
         process = subprocess.Popen(cmd.split(' '), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate(input=b'\n\n')
+        time.sleep(5)
+        stdout, stderr = process.communicate(input=b'\n')
+        process.wait(timeout=60)
         print(stdout)
         print('\n')
         print(stderr)
@@ -179,59 +210,38 @@ def run_command(command):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-u', '--username', required=False, help='')
-    parser.add_argument('-p', '--password', required=False, help='')
+    parser.add_argument('action', choices=DEFAULTS['ACTION_CHOICES'])
+    action_arg = parser.parse_known_args()[0].action
+    parser.add_argument('-H', '--hosts', help='Host addresses where generated SSL cert will be send', nargs='+')
     parser.add_argument('-d', '--domains', nargs='+', required=False, help='')
+    parser.add_argument('-p', '--password', required=False, help='')
+    if action_arg == CHECK_ACTION:
+        parser.add_argument('-a', '--authFile',
+                            default=DEFAULTS['AUTH_FILE'],
+                            help=f'Auth file with <username>:<password> format to DNS provider in '
+                                 f'order to add TXT record to pass acme challange, default is {DEFAULTS["AUTH_FILE"]}')
+    parser.add_argument('--stateFile', help=f'File to keep temp data about pending DNS challenges, default path is {DEFAULTS["STATE_FILE"]}', default=DEFAULTS['STATE_FILE'])
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     logging.basicConfig(filename='file.log', format='%(asctime)s %(name)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S', level=logging.DEBUG)
-    domain1 = Domain(None, '1', 'juliakowalska', 'com')
-    domain2 = Domain(None, '1', 'siedlaczek', 'org.pl')
-    certbot = CertBot(domain1)
-    print(certbot.key)
-    print(certbot.value)
-    print(certbot.is_txt_record_present())
-    certbot.get_certs()
+    cert = Certificate('/etc/letsencrypt/live/juliakowalska.com/cert.pem')
+    sys.exit(0)
     try:
-        #msg, return_code = run_command('certbot certonly --dry-run  --test-cert -m admin@siedlaczek.org.pl --agree-tos --manual --manual-public-ip-logging-ok -d \*.siedlaczek.org.pl -d siedlaczek.org.pl --preferred-challenges dns > test.txt')
-        #msg, return_code = run_command('certbot certonly --manual --manual-auth-hook /mnt/f/Programs/Repository/Python/cert-tool/acme-dns-auth.py --preferred-challenges dns --debug-challenges -d aap.example.com')
-        print('end')
-
-        #provider = Provider(args.username, args.password)
-        #domain = provider.get_domain_by_name('some_domain')
-        #domain.add_dns_record('test', 'TXT', '1.1.1.1')
-        #domain.remove_dns_record('test', 'TXT', '1.1.1.1')
+        test_domain = Domain(None, '1', 'babski-swiat', 'pl')
+        test_domain_2 = Domain(None, '1', 'siedlaczek', 'org.pl')
+        certbot = CertBot(test_domain, args.stateFile)
+        print(f'{certbot.key}: {certbot.value}')
+        print(test_domain.has_record('TXT', certbot.value, '_acme-challenge'))
+        if test_domain.has_record('TXT', certbot.value, '_acme-challenge'):
+            certbot.generate_cert()
+        # provider = Provider(args.authFile)
+        # domain = provider.get_domain_by_name('some_domain')
+        # domain.add_dns_record('test', 'TXT', '1.1.1.1')
+        # domain.remove_dns_record('test', 'TXT', '1.1.1.1')
     except (ConnectionRefusedError, ValueError, LookupError, FileNotFoundError) as e:
         logging.error(f'{os.path.basename(__file__)}: {e}')
         print(f'{os.path.basename(__file__)}: {e}')
-
-# dig +short -t txt siedlaczek.org.pl
-#certbot certonly --manual --preferred-challenges=dns --email admin@siedlaczek.org.pl --manual-public-ip-logging-ok --server https://acme-v02.api.letsencrypt.org/directory --agree-tos -d siedlaczek.org.pl -d *.siedlaczek.org.pl
-#certbot certonly -n -m admin@siedlaczek.org.pl --agree-tos --manual --manual-public-ip-logging-ok --manual-auth-hook /mnt/f/Programs/Repository/Python/cert-tool/acme-dns-auth.py -d \*.siedlaczek.org.pl -d siedlaczek.org.pl --preferred-challenges dns
-#certbot -d \*.siedlaczek.org.pl --manual-public-ip-logging-ok -d siedlaczek.org.pl --manual --preferred-challenges dns certonly
-#certbot certonly -m -n admin@siedlaczek.org.pl --agree-tos -d \*.siedlaczek.org.pl -d siedlaczek.org.pl --manual --preferred-challenges dns
-
-
-
-#  pip install certbot-external-auth
-
-
-# regex = fr'^(?P<txt_key>_acme-challenge.{domain.name})'
-    # key = None
-    # try:
-    #     with open(f'{acme_values_path}/{domain.name}.txt', 'r') as f:
-    #         lines = f.readlines()
-    #         for line in lines:
-    #             if key and line.strip() != "":
-    #                 value = line.strip()
-    #                 break
-    #             result = re.search(regex, line)
-    #             if result:
-    #                 key = result.group('txt_key')
-    #     print(f'{key}: {value}')
-    #     return key, value
-    # except Exception as e:
-    #     raise type(e)(f'Failed retrieving TXT records for "{domain.name}" domain with error message: "{e}"')
+        sys.exit(1)
