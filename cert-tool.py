@@ -10,10 +10,12 @@ import logging
 import argparse
 import requests
 import subprocess
+from datetime import datetime
 import ssl
+from requests.exceptions import SSLError, RequestException
 import socket
 
-CHECK_ACTION = 'check'
+CHECK_ACTION = 'check-certs'
 INIT_ACTION = 'init'
 LIST_ACTION = 'list'
 
@@ -21,24 +23,47 @@ DEFAULTS = {
     'ACTION_CHOICES': [CHECK_ACTION, INIT_ACTION, LIST_ACTION],
     'RECORD_TYPES': ['TXT', 'A', 'AAAA', 'MX', 'CNAME', 'REDIRECT', 'FRAME', 'CAA'],
     'STATE_FILE': f'{os.path.dirname(os.path.realpath(__file__))}/dns_challenges.yaml',
-    'AUTH_FILE': os.path.join(os.path.expanduser("~"), '.cert-tool.passwd')
+    'AUTH_FILE': os.path.join(os.path.expanduser("~"), '.cert-tool.passwd'),
+    'BASE_CERTS_PATH': '/etc/letsencrypt/live/',
+    'DAYS_TO_EXPIRE': 14
 }
 
 
 class Certificate:
-    def __init__(self, path):
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f'Certificate file {path} does not exist')
-        self.path = path
+    def __init__(self, cert_file, chain_file):
+        if not os.path.isfile(cert_file) or not os.path.isfile(chain_file):
+            raise FileNotFoundError(f'Certificate file "{cert_file}" or chain file "{chain_file}" does not exist')
+        self.cert_file = cert_file
+        self.chain_file = chain_file
+        self.__is_valid()
+        self.__set_dates()
+
+    def __is_valid(self):
+        msg, exit_code = run_command(f'openssl verify -untrusted {self.chain_file} {self.cert_file}')
+        if exit_code > 0:
+            raise SSLError(f'Validate "{self.cert_file}" cert file with "{self.chain_file}" chain file failed with message: "{msg.strip()}" and exit code {exit_code}')
+
+    def __set_dates(self):
+        msg, exit_code = run_command(f'openssl x509 -dates -noout < {self.cert_file}')
+        if exit_code > 0:
+            raise SSLError(f'Checking expire date of "{self.cert_file}" cert failed with message: "{msg.strip()}" and exit code {exit_code}')
+        dates = re.search('notBefore=(.*GMT)[\s]+notAfter=(.*GMT)', msg)
+        date_pattern = '%b %d %H:%M:%S %Y %Z'
+        self.issued_date = datetime.strptime(dates.group(1), date_pattern)
+        self.expire_date = datetime.strptime(dates.group(2), date_pattern)
+
+    def is_expiring(self, days):
+        curr_time = datetime.now()
+        return (self.expire_date - curr_time).days < days
 
 
 class Domain:
     records = []
 
-    def __init__(self, provider, id, name, extension):
-        self.provider = provider
+    def __init__(self, name, id=None, provider=None):
         self.id = id
-        self.name = f'{name}.{extension}'
+        self.name = name
+        self.provider = provider
 
     def add_record(self, subdomain, record_type, value, priority=0, ttl=86400):
         dns_records = self.get_records()
@@ -79,24 +104,19 @@ class Domain:
     def get_records(self):
         return self.records if self.records else self.provider.get_records(self)
 
-    def has_record(self, record_type, value, prefix=None):
-        fqdn = f"{prefix}.{self}" if prefix else self
+    def has_record(self, record_type, key, value):
         if record_type not in DEFAULTS['RECORD_TYPES']:
-            raise ValueError(f'Cannot check "{record_type}" record with "{value}" value for "{fqdn}" domain, allowed record types are: {", ".join(DEFAULTS["RECORD_TYPES"])}')
-        msg, return_code = run_command(f'dig -t {record_type} {fqdn} +short')
+            raise ValueError(f'Cannot check "{record_type}" record with "{value}" value for "{self}" domain, allowed record types are: {", ".join(DEFAULTS["RECORD_TYPES"])}')
+        msg, return_code = run_command(f'dig -t {record_type} {key} +short')
         try:
             msg = msg.strip().replace('"', '')
         except AttributeError:
             return False
-        if msg and msg != value:
-            logging.warning(f'{record_type} record for "{fqdn}" domain returned "{msg}" value, not expected "{value}" value')
+        if msg and msg != value:  # TODO - trzeba ten moment zlapac
+            logging.warning(f'{record_type} record for "{self}" domain returned "{msg}" value, not expected "{value}" value')
             return False
         else:
             return True if msg == value else False
-
-    # def get_cert_expire_date(self):
-    #     ctx = ssl.create_default_context()
-    #     with ctx.wrap_socket(socket.socket())
 
     def __str__(self):
         return self.name
@@ -124,7 +144,7 @@ class Provider:
     def __set_domains(self):
         domains = self.__get_data(f'{self.base_url}/api/domains/getPlDomains/0')['list']
         for domain_json in domains:
-            domain = Domain(self, domain_json['domain_id'], domain_json['domain_name'], domain_json['domain_ext'])
+            domain = Domain(f'{domain_json["domain_name"]}.{domain_json["domain_ext"]}', domain_json['domain_id'], self)
             self.domains.append(domain)
 
     def get_records(self, domain):
@@ -149,43 +169,48 @@ class Provider:
 class CertBot:
     server = 'https://acme-v02.api.letsencrypt.org/directory'
 
-    def __init__(self, domain, state_file):
+    def __init__(self, state_file, base_certs_path):
         self.state_file = state_file
         if not os.path.isfile(self.state_file):
             with open(self.state_file, 'w') as f:
                 pass
-        self.domain = domain
-        self.__set_challenge_values()
+        self.base_certs_path = base_certs_path
 
-    def __set_challenge_values(self):
+    def set_challenge_values(self, domain):
+        try:
+            record_type, key, value = self.get_challenge_values(domain)
+            logging.info(f'found DNS challenge values for "{domain}" domain, {record_type} record to add is '
+                         f'"{key}={value}" and it is saved in "{self.state_file}" file, no changes have been made')
+        except (KeyError, TypeError):
+            cmd = f'certbot certonly --manual --preferred-challenges dns ' \
+                  f'--email admin@{domain.name} --agree-tos --manual-public-ip-logging-ok ' \
+                  f'--server {self.server} -d {domain.name} -d *.{domain.name} 2> /dev/null'
+            logging.debug(f'request for DNS challenge values for "{domain}" domain has been sent to "{self.server}" server')
+            msg, exit_code = run_command(cmd)
+            # print(msg)
+            # print(cmd)
+            challenge_values = re.search(f'name[\s]*(.*.{domain.name}).*value:[\s]*([a-zA-Z-_0-9]*)', msg)
+            if not challenge_values.groups():
+                raise RequestException(f'An error occurred while requesting for DNS challenge values, challenge values '
+                                       f'are empty, message: "{msg.strip()}" and exit code {exit_code}')
+            with open(self.state_file, 'a') as file:
+                yaml.dump({
+                    domain.name: {
+                        'type': 'TXT',
+                        'key': challenge_values.group(1),
+                        'value': challenge_values.group(2)}}, file)
+            record_type, key, value = self.get_challenge_values(domain)
+            logging.info(f'new DNS challenge values for "{domain}" domain with "{key}={value}" {record_type} record '
+                         f'to add has been saved in "{self.state_file}" file')
+
+    def get_challenge_values(self, domain):
         with open(self.state_file, 'r') as f:
             dns_challenges = yaml.safe_load(f)
-        try:
-            self.key = dns_challenges[self.domain.name]['txt_key']
-            self.value = dns_challenges[self.domain.name]['txt_value']
-            self.state = dns_challenges[self.domain.name]['state']
-        except (KeyError, TypeError):
-            cmd = f'certbot certonly --manual --preferred-challenges dns --email admin@{self.domain.name} --agree-tos --manual-public-ip-logging-ok --server {self.server} -d {self.domain.name} -d *.{self.domain.name} 2> /dev/null'
-            print(cmd)
-            logging.info(f'request for dns challenge values for "{self.domain}" domain has been sent')
-            msg, return_code = run_command(cmd)
-            # msg = '- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Please deploy a DNS TXT record under the name _acme-challenge.juliakowalska.com with the following value:  gLfzfmGYM-JDh6YDB9Or9FP2-ODNbK4hI0qgdjGbhow  Before continuing, verify the record is deployed. - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Press Enter to Continue'
-            print(msg)
-            challenge_values = re.search(f'name[\s]*(.*.{self.domain.name}).*value:[\s]*([a-zA-Z-_0-9]*)', msg)
-            with open(self.state_file, 'a') as file:
-                state = 'pending'
-                yaml.dump({
-                    self.domain.name: {
-                        'txt_key': challenge_values.group(1),
-                        'txt_value': challenge_values.group(2),
-                        'state': state}}, file)
-                self.key = challenge_values[0]
-                self.value = challenge_values[1]
-                self.state = state
-            logging.info(f'new values for dns challenge "{self.domain}" domain has been saved in "{self.state_file}" with "{self.state}" state')
+        return dns_challenges[domain.name]["type"], dns_challenges[domain.name]["key"], dns_challenges[domain.name]["value"]
 
-    def generate_cert(self):
-        cmd = f'certbot certonly --manual --preferred-challenges dns --email admin@{self.domain.name} --agree-tos --manual-public-ip-logging-ok --server {self.server} -d {self.domain.name} -d *.{self.domain.name}'
+    def generate_cert(self, domain):
+        cmd = f'certbot certonly --manual --preferred-challenges dns --email admin@{domain.name} --agree-tos ' \
+              f'--manual-public-ip-logging-ok --server {self.server} -d {domain.name} -d *.{domain.name}'
         print(cmd)
         process = subprocess.Popen(cmd.split(' '), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(5)
@@ -215,7 +240,17 @@ def parse_args():
     parser.add_argument('-H', '--hosts', help='Host addresses where generated SSL cert will be send', nargs='+')
     parser.add_argument('-d', '--domains', nargs='+', required=False, help='')
     parser.add_argument('-p', '--password', required=False, help='')
+    parser.add_argument('--baseCertsPath',
+                        default=DEFAULTS['BASE_CERTS_PATH'],
+                        help=f'Base paths to certs and chains, '
+                        f'default is {DEFAULTS["BASE_CERTS_PATH"]}.\nExample chain is {DEFAULTS["BASE_CERTS_PATH"]}/<domain>/chain.pem, '
+                        f'example cert is {DEFAULTS["BASE_CERTS_PATH"]}/<domain>/cert.pem')
     if action_arg == CHECK_ACTION:
+        parser.add_argument('-d', '--days',
+                            default=DEFAULTS['DAYS_TO_EXPIRE'],
+                            help=f'Days to expire certificate when script should issue for a new SSL certificate '
+                                 f'for domain, defaults is {DEFAULTS["DAYS_TO_EXPIRE"]}')
+    if action_arg == INIT_ACTION:
         parser.add_argument('-a', '--authFile',
                             default=DEFAULTS['AUTH_FILE'],
                             help=f'Auth file with <username>:<password> format to DNS provider in '
@@ -227,9 +262,30 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     logging.basicConfig(filename='file.log', format='%(asctime)s %(name)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S', level=logging.DEBUG)
-    cert = Certificate('/etc/letsencrypt/live/juliakowalska.com/cert.pem')
-    sys.exit(0)
+
     try:
+        if args.action == CHECK_ACTION:
+            certbot = CertBot(args.stateFile, args.baseCertsPath)
+            for domain_name in args.domains:
+                domain = Domain(domain_name)
+                cert = Certificate(f'{certbot.base_certs_path}/{domain.name}/cert.pem', f'{certbot.base_certs_path}/{domain.name}/chain.pem')
+                if cert.is_expiring(args.days):
+                    logging.info(f'domain "{domain}" will expire for less than {args.days}, generating challenge values...')
+                    certbot.set_challenge_values(domain)
+        elif args.action == INIT_ACTION:
+            certbot = CertBot(args.stateFile, args.baseCertsPath)
+            for domain_name in args.domains: # TODO - add state to validate if record has been added to dns [new, pending/digging]
+                domain = Domain(domain_name)
+                record_type, key, value = certbot.get_challenge_values(domain)
+                if domain.has_record(record_type, key, value):
+                    logging.info(f'domain "{domain}" has visible {record_type} record "{key}={value}", issuing for SSL certificate...')
+                    certbot.generate_cert(domain)
+
+        cert = Certificate('/etc/letsencrypt/live/juliakowalska.com/cert.pem', '/etc/letsencrypt/live/juliakowalska.com/fullchain.pem')
+        print(cert.issued_date)
+        print(cert.expire_date)
+        print(cert.is_expiring(15))
+        sys.exit(0)
         test_domain = Domain(None, '1', 'babski-swiat', 'pl')
         test_domain_2 = Domain(None, '1', 'siedlaczek', 'org.pl')
         certbot = CertBot(test_domain, args.stateFile)
@@ -241,7 +297,12 @@ if __name__ == "__main__":
         # domain = provider.get_domain_by_name('some_domain')
         # domain.add_dns_record('test', 'TXT', '1.1.1.1')
         # domain.remove_dns_record('test', 'TXT', '1.1.1.1')
-    except (ConnectionRefusedError, ValueError, LookupError, FileNotFoundError) as e:
+    except (ConnectionRefusedError, ValueError, LookupError, FileNotFoundError, SSLError, FileNotFoundError, RequestException) as e:
         logging.error(f'{os.path.basename(__file__)}: {e}')
         print(f'{os.path.basename(__file__)}: {e}')
         sys.exit(1)
+
+        # msg = '- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Please deploy a DNS TXT record under the name _acme-challenge.juliakowalska.com with the following value:  gLfzfmGYM-JDh6YDB9Or9FP2-ODNbK4hI0qgdjGbhow  Before continuing, verify the record is deployed. - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - Press Enter to Continue'
+
+        #self.issued_date = issued_date_gmt.replace(tzinfo=tz.tzutc()).astimezone(tz.tzlocal())
+        #self.expire_date = expire_date_gmt.replace(tzinfo=tz.tzutc()).astimezone(tz.tzlocal())
